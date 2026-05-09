@@ -1,0 +1,220 @@
+# ── Perspectiv — production docker-compose ─────────────────────────────────
+#
+# Single-host deployment: Perspectiv + PostgreSQL (with TimescaleDB) +
+# Traefik reverse-proxy (automatic TLS via Let's Encrypt HTTP-01).
+#
+# Usage:
+#     cp .env.example .env      # edit values for your deployment
+#     docker compose up -d
+#     docker compose logs -f perspectiv
+#
+# Requirements on the host:
+#     * Docker Engine 24+ with compose plugin
+#     * A DNS A record pointing ${PERSPECTIV_HOSTNAME} at this box
+#     * Ports 80 and 443 reachable from the public internet (for Let's
+#       Encrypt HTTP-01 challenge; optional if you supply your own cert)
+
+name: perspectiv
+
+services:
+
+  # ── PostgreSQL + TimescaleDB ───────────────────────────────────────────
+  postgres:
+    image: timescale/timescaledb:2.17.2-pg16
+    container_name: perspectiv-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB:-perspectiv}
+      POSTGRES_USER:     ${POSTGRES_USER:-perspectiv_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      # TimescaleDB's auto-tune runs on first boot via the official image.
+      TS_TUNE_MEMORY:    ${TS_TUNE_MEMORY:-8GB}
+      TS_TUNE_NUM_CPUS:  ${TS_TUNE_NUM_CPUS:-4}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Backups land here so `scripts/backup.sh` can read them from the host.
+      - ./backups:/backups
+    # Exposing 5432 on loopback only lets you `psql -h 127.0.0.1` from the
+    # host for troubleshooting, but keeps it off any external interface.
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-perspectiv_user} -d ${POSTGRES_DB:-perspectiv}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - perspectiv-net
+
+  # ── Perspectiv application ─────────────────────────────────────────────
+  perspectiv:
+    image: ghcr.io/perspectiv-net/perspectiv:${PERSPECTIV_VERSION:-latest}
+    container_name: perspectiv-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Application settings picked up by core.start_all() and web.server.
+      PERSPECTIV_HOSTNAME: ${PERSPECTIV_HOSTNAME:?set PERSPECTIV_HOSTNAME in .env}
+      PERSPECTIV_PORT:     5000
+      # Force the app to serve plain HTTP on :5000 — Traefik handles all
+      # TLS termination upstream. Without this, the app auto-flips to
+      # HTTPS-on-:5000 the moment cert.pem/key.pem appear under /app/web,
+      # which causes Traefik to fail proxying with "Empty reply from
+      # server" (TLS-server-receiving-HTTP). Customers running custom
+      # reverse proxies (nginx, HAProxy, Caddy) should also set this.
+      PERSPECTIV_DISABLE_INTERNAL_TLS: "1"
+      # The app reads its DB config from db_config.json; we generate that
+      # file at container-start time from the env so customers only
+      # maintain one config surface (.env).
+      POSTGRES_HOST:       postgres
+      POSTGRES_PORT:       5432
+      POSTGRES_DB:         ${POSTGRES_DB:-perspectiv}
+      POSTGRES_USER:       ${POSTGRES_USER:-perspectiv_user}
+      POSTGRES_PASSWORD:   ${POSTGRES_PASSWORD}
+      # SNMP / syslog / netflow / trap listeners bind inside the
+      # container; they're exposed via docker-compose "ports" below.
+      TZ:                  ${TZ:-UTC}
+      # Keep the Fernet encryption key on a named volume so it survives
+      # image rebuilds. Losing this key means every ENC:... value in the
+      # DB becomes unrecoverable plaintext garbage.
+      PERSPECTIV_KEY_PATH: /app/keyring/perspectiv.key
+      # Persistent instance UUID used for license-key binding. Stays on
+      # the keyring volume so license validation survives image
+      # rebuilds and VM moves. First boot generates a fresh UUIDv4.
+      PERSPECTIV_INSTANCE_UUID_PATH: /app/keyring/instance.uuid
+      # Device-config backups land on the persistent perspectiv-data volume
+      # (inside the container) rather than the bind-mounted ./backups
+      # directory — bind mounts hit UID/GID mismatches between the
+      # container's perspectiv user and the host directory owner. Override
+      # to "./backups" if you want files directly visible on the host.
+      PERSPECTIV_BACKUP_DIR: /app/data/backups
+    volumes:
+      # Persist backup artefacts + web certs + any customer uploads.
+      - perspectiv-data:/app/data
+      - ./backups:/app/backups
+      # db_config.json is auto-generated at container startup from the
+      # POSTGRES_* env vars (see database/db_factory.py::_config_from_env).
+      # We mount a volume at the target so the generated file survives
+      # restarts without needing manual intervention.
+      - perspectiv-config:/app/config
+      # perspectiv.key — Fernet encryption key used to encrypt device
+      # credentials (SSH/SNMP v3 passwords, enable passwords, SMTP auth,
+      # webhook secrets, etc). MUST persist across image rebuilds —
+      # losing the key means every encrypted value in the DB becomes
+      # unrecoverable and has to be re-entered by hand. Mounted as a
+      # named volume rather than a bind mount so the container manages
+      # permissions.
+      - perspectiv-keyring:/app/keyring
+    # Override the image's HEALTHCHECK. Pre-0.3.3 images shipped a
+    # Dockerfile that calls `/healthz` (no such route — actual is
+    # `/health`); the in-image healthcheck has been failing silently
+    # in every release. That latent bug becomes a hard failure under
+    # Traefik 3.x because the docker provider filters unhealthy
+    # containers out of the routing table — symptom: every request
+    # returns Traefik's default 404 even though all labels and
+    # networking look correct. Defining `healthcheck:` here at the
+    # compose layer overrides whatever the image baked in, so this
+    # bundle works against both fixed (0.3.3+) and broken (≤0.3.2)
+    # images. Safe to leave in place permanently.
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://127.0.0.1:5000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+    # Monitoring-plane ports (syslog/netflow/snmp-trap) are UDP. Expose
+    # only what the customer actually uses by overriding in their own
+    # docker-compose.override.yml.
+    ports:
+      # Syslog  (RFC 5424, UDP)
+      - "1514:1514/udp"
+      # NetFlow v5/v9/IPFIX
+      - "2055:2055/udp"
+      # SNMP traps
+      - "1162:1162/udp"
+    labels:
+      # ── Traefik routing ─────────────────────────────────────────────
+      - "traefik.enable=true"
+      - "traefik.docker.network=perspectiv-net"
+      # HTTPS router — catches ${PERSPECTIV_HOSTNAME} on :443
+      - "traefik.http.routers.perspectiv.rule=Host(`${PERSPECTIV_HOSTNAME}`)"
+      - "traefik.http.routers.perspectiv.entrypoints=websecure"
+      - "traefik.http.routers.perspectiv.tls=true"
+      - "traefik.http.routers.perspectiv.tls.certresolver=letsencrypt"
+      # Send traffic to the container's internal port 5000
+      - "traefik.http.services.perspectiv.loadbalancer.server.port=5000"
+      # Security headers middleware (defined in traefik/dynamic.yml)
+      - "traefik.http.routers.perspectiv.middlewares=secure-headers@file"
+    networks:
+      - perspectiv-net
+
+  # ── Traefik reverse-proxy + auto-TLS ───────────────────────────────────
+  traefik:
+    # Pinning to :latest (rolling, the most recent stable release)
+    # rather than a specific minor like v3.2 — modern Docker daemons
+    # (29.x+) have raised the minimum supported API version above
+    # what older Traefik patches' bundled Go SDK speaks, and a stale
+    # Traefik silently fails to discover containers on a fresh
+    # Ubuntu host. Symptom: "every request returns Traefik's 404
+    # page" because the Docker provider can't list containers (logs
+    # show "client version 1.24 is too old"). The image bump alone is
+    # enough — Traefik 3.6+ negotiates the API version automatically.
+    # Do NOT add `apiVersion:` to traefik/traefik.yml under
+    # providers.docker; that field was removed in v3 and now causes a
+    # "field not found, node: apiVersion" startup crash.
+    image: traefik:latest
+    container_name: perspectiv-traefik
+    restart: unless-stopped
+    command:
+      # Load the static config from a file mount (easier to reason about
+      # than a 15-line command list).
+      - "--configFile=/etc/traefik/traefik.yml"
+    environment:
+      LETSENCRYPT_EMAIL: ${LETSENCRYPT_EMAIL:?set LETSENCRYPT_EMAIL in .env}
+      # NOTE: DOCKER_API_VERSION is intentionally not set here —
+      # Traefik's wrapper around the Go SDK doesn't read that env var,
+      # and Traefik 3.6+ negotiates the API version with the daemon
+      # automatically anyway. If you see "client version 1.24 is too
+      # old" in the logs, the fix is to bump the `image:` tag above,
+      # not to pin via env or static config.
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      # Let Traefik see Docker events so it can discover perspectiv's
+      # labels automatically as the container comes up.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Static + dynamic config, mounted read-only.
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+      # ACME state (certs + private keys) — persisted so Let's Encrypt
+      # doesn't reissue on every restart (rate limits).
+      - traefik-acme:/letsencrypt
+    networks:
+      - perspectiv-net
+
+networks:
+  perspectiv-net:
+    # Pin the literal Docker network name to `perspectiv-net` so it
+    # doesn't get the Compose project-prefix (`perspectiv_perspectiv-net`).
+    # Traefik's docker provider matches containers via the
+    # `traefik.docker.network=perspectiv-net` label and the
+    # `network: perspectiv-net` setting in traefik/traefik.yml — those
+    # references are literal, so the actual Docker network name has to
+    # match exactly. Without `name:` here, Compose prefixes the network
+    # with the project name and Traefik silently skips the perspectiv
+    # container (symptom: zero "Creating router" lines in the Traefik
+    # logs, every request returns Traefik's default 404).
+    name: perspectiv-net
+    driver: bridge
+
+volumes:
+  postgres-data:
+    # Named volume — `docker volume ls` shows it as perspectiv_postgres-data.
+    # To relocate to a specific host path, override in docker-compose.override.yml.
+  perspectiv-data:
+  perspectiv-config:
+  perspectiv-keyring:
+  traefik-acme:
