@@ -1,0 +1,51 @@
+# ── Traefik v3 — dynamic configuration ─────────────────────────────────────
+#
+# This file is hot-reloaded whenever it changes (no container restart
+# required). Contains reusable middlewares referenced by router labels.
+
+http:
+  middlewares:
+
+    # Security headers applied to every response from Perspectiv.
+    # These are conservative defaults — most web-security scanners
+    # (securityheaders.com, Mozilla Observatory) give them an A+ grade
+    # out of the box.
+    secure-headers:
+      headers:
+        # Hide server version identifying info
+        customFrameOptionsValue: "SAMEORIGIN"
+        contentTypeNosniff:      true
+        browserXssFilter:        true
+        referrerPolicy:          "strict-origin-when-cross-origin"
+        # HSTS — force HTTPS for 1 year. Customers with legitimate
+        # plain-HTTP needs should remove this from their override.
+        stsSeconds:              31536000
+        stsIncludeSubdomains:    true
+        stsPreload:              false
+        forceSTSHeader:          true
+        # Content-Security-Policy kept permissive because the dashboard
+        # includes inline Chart.js configuration; tightening this is a
+        # future hardening pass.
+        contentSecurityPolicy:   "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://cdn.simpleicons.org; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://cdn.simpleicons.org; connect-src 'self' ws: wss:; frame-ancestors 'self';"
+        # X-Powered-By removal (Perspectiv doesn't set one, but belt-and-suspenders)
+        customResponseHeaders:
+          X-Powered-By: ""
+          Server:       ""
+
+    # Rate limit — 100 req/s per client IP, short burst allowed.
+    # Tune up/down based on fleet size; a customer with 500 operators
+    # will need higher limits than one with 5.
+    rate-limit:
+      rateLimit:
+        average: 100
+        burst:   200
+
+    # Optional: IP allowlist. Uncomment and populate if the customer
+    # wants to restrict access to their office / VPN network.
+    #
+    # allowlist:
+    #   ipAllowList:
+    #     sourceRange:
+    #       - "10.0.0.0/8"
+    #       - "192.168.0.0/16"
+    #       - "203.0.113.42"           # office public IP
