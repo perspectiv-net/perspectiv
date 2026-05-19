@@ -1,0 +1,83 @@
+# ── Traefik v3 — static configuration ──────────────────────────────────────
+#
+# This file is loaded once at startup. Runtime routing rules come from
+# Docker container labels (see docker-compose.yml) and from
+# dynamic.yml (middlewares).
+
+# Redirect plain HTTP to HTTPS — no unencrypted traffic ever reaches the
+# app layer.
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+  websecure:
+    address: ":443"
+    http:
+      # TLS is terminated here; every connection uses a resolver-issued cert.
+      tls:
+        certResolver: letsencrypt
+
+# ── Dynamic providers ────────────────────────────────────────────────────
+# Watch Docker for container labels (primary routing source) + load the
+# file provider for reusable middlewares.
+providers:
+  docker:
+    endpoint: "unix:///var/run/docker.sock"
+    # NOTE: do NOT add an `apiVersion:` field here — that key existed
+    # in Traefik v2's Docker provider but was removed in v3 (you'll
+    # see "command traefik error: field not found, node: apiVersion"
+    # at startup). Traefik 3.6+ ships a Docker SDK that negotiates the
+    # API version with the daemon automatically; no pin needed against
+    # modern Docker (24+). The :latest image bump in docker-compose.yml
+    # is what actually fixes the "client version 1.24 is too old"
+    # error we saw against Docker 29.x — older Traefik patches' SDKs
+    # speak API 1.24 and the modern daemon refuses them.
+    # Only route containers that explicitly opt in via `traefik.enable=true`.
+    # Prevents accidentally exposing other containers on the same host.
+    exposedByDefault: false
+    network: perspectiv-net
+  file:
+    filename: /etc/traefik/dynamic.yml
+    watch: true
+
+# ── Let's Encrypt ACME ───────────────────────────────────────────────────
+# HTTP-01 challenge — requires :80 reachable from the public internet.
+# For air-gapped / internal deployments, drop this section and provide
+# a customer-supplied cert via a file mount instead (see dynamic.yml
+# for the `certificates:` block example).
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: ""                                     # <-- set via env below
+      storage: /letsencrypt/acme.json
+      httpChallenge:
+        entryPoint: web
+
+# ── Observability ────────────────────────────────────────────────────────
+log:
+  level: INFO
+accessLog:
+  format: json
+  filters:
+    # Don't spam the access log with health-check probes — they fire
+    # every 30s and dwarf real traffic otherwise.
+    minDuration: "100ms"
+    retryAttempts: true
+
+# ── API / dashboard ──────────────────────────────────────────────────────
+# Enabled but ONLY locally — in prod, customers reach Traefik's internal
+# state via `docker exec traefik`. Exposing the Traefik dashboard on the
+# public internet is a common misconfiguration we want to avoid by default.
+api:
+  dashboard: true
+  insecure: false
+
+# ── Global config ────────────────────────────────────────────────────────
+global:
+  checkNewVersion: false
+  sendAnonymousUsage: false
