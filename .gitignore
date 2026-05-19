@@ -1,0 +1,48 @@
+# ── Perspectiv deploy bundle — .gitignore ────────────────────────────────
+# These patterns prevent operator-local files from being accidentally
+# committed back to a fork. The deploy bundle itself is a small,
+# tracked set of files; everything below is generated at runtime by the
+# customer's own deployment.
+
+# Customer environment + secrets — NEVER commit
+.env
+.env.local
+*.env
+!.env.example
+
+# TLS material — should be generated per-install or issued by Let's Encrypt
+*.pem
+*.key
+*.crt
+*.cer
+*.pfx
+*.p12
+
+# Customer database backups + restore artefacts
+backups/
+*.sql
+*.dump
+*.tar.gz
+*.tgz
+
+# Operational logs
+*.log
+logs/
+
+# Docker state (named volumes live outside the repo, but local override
+# files for development should not be committed)
+docker-compose.override.yml
+docker-compose.local.yml
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Working artefacts
+tmp/
+temp/
